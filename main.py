@@ -21,9 +21,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("max-photo-bot")
 
-BOT_VERSION = "2"
+BOT_VERSION = "3"
 _ROOT = Path(__file__).resolve().parent
 _DEFAULT_CA_BUNDLE = _ROOT / "certs" / "russian_trusted_ca_bundle.pem"
+DEFAULT_CHAT_ID = "-73114090287804"
 
 API_BASE = (os.environ.get("MAX_API_BASE") or "https://platform-api2.max.ru").rstrip("/")
 BOT_TOKEN = (os.environ.get("BOT_TOKEN") or os.environ.get("MAX_BOT_TOKEN") or "").strip()
@@ -70,8 +71,12 @@ def _parse_id_set(raw: str) -> set[str]:
     return out
 
 
-# Пустой allowlist = принимать из всех чатов (удобно узнать chat_id через /chatid).
-ALLOWED_CHAT_IDS = _parse_id_set(os.environ.get("ALLOWED_CHAT_IDS") or "")
+# Пустой ALLOWED_CHAT_IDS в env → дефолтный рабочий чат; "*" или "all" → все чаты.
+_allowed_raw = (os.environ.get("ALLOWED_CHAT_IDS") or DEFAULT_CHAT_ID).strip()
+if _allowed_raw.lower() in {"*", "all", "any"}:
+    ALLOWED_CHAT_IDS: set[str] = set()
+else:
+    ALLOWED_CHAT_IDS = _parse_id_set(_allowed_raw)
 
 
 def _require_env() -> None:
