@@ -5,6 +5,12 @@ MAX-бот: сидит в чате, забирает фото заказов и 
 
 Аналог [optical-telegram-photo-bot](https://github.com/evgeny-source/ozordersfotobot), но для мессенджера MAX.
 
+## SSL / сертификат Минцифры
+
+`platform-api2.max.ru` подписан УЦ Минцифры. В репозитории лежит бандл
+`certs/russian_trusted_ca_bundle.pem` — бот подмешивает его к системным CA
+автоматически. Если проверка всё равно падает: `SSL_VERIFY=0` (временный обход).
+
 ## Что принимает
 
 - Вложения `type=image` (и файлы-картинки)

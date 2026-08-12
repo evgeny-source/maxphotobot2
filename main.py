@@ -6,8 +6,10 @@ from __future__ import annotations
 import logging
 import os
 import re
+import ssl
 import sys
 import time
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -19,7 +21,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("max-photo-bot")
 
-BOT_VERSION = "1"
+BOT_VERSION = "2"
+_ROOT = Path(__file__).resolve().parent
+_DEFAULT_CA_BUNDLE = _ROOT / "certs" / "russian_trusted_ca_bundle.pem"
 
 API_BASE = (os.environ.get("MAX_API_BASE") or "https://platform-api2.max.ru").rstrip("/")
 BOT_TOKEN = (os.environ.get("BOT_TOKEN") or os.environ.get("MAX_BOT_TOKEN") or "").strip()
@@ -42,6 +46,11 @@ SHOW_IDS_IN_REPLY = (os.environ.get("SHOW_IDS_IN_REPLY") or "0").strip().lower()
 HTTP_TIMEOUT = float(os.environ.get("HTTP_TIMEOUT_SEC") or "60")
 POLL_TIMEOUT = int(os.environ.get("POLL_TIMEOUT_SEC") or "30")
 POLL_LIMIT = int(os.environ.get("POLL_LIMIT") or "100")
+# SSL для platform-api2.max.ru (сертификат Минцифры). По умолчанию — бандл в certs/.
+# SSL_VERIFY=0 — отключить проверку (крайний случай).
+# SSL_CA_BUNDLE=/path/to.pem — свой бандл.
+SSL_VERIFY_RAW = (os.environ.get("SSL_VERIFY") or "1").strip().lower()
+SSL_CA_BUNDLE = (os.environ.get("SSL_CA_BUNDLE") or "").strip()
 
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".heic"}
 _ID_REQUEST_RE = re.compile(
@@ -49,6 +58,7 @@ _ID_REQUEST_RE = re.compile(
     r"|^\s*chat\s*id\s*$"
     r"|^\s*айди\s*$"
 )
+_SSL_VERIFY: ssl.SSLContext | bool | str = True
 
 
 def _parse_id_set(raw: str) -> set[str]:
@@ -77,6 +87,31 @@ def _require_env() -> None:
     if missing:
         logger.error("Не заданы переменные окружения: %s", ", ".join(missing))
         sys.exit(1)
+
+
+def _build_ssl_verify() -> ssl.SSLContext | bool | str:
+    """TLS для MAX API: системные CA + сертификаты Минцифры из бандла."""
+    if SSL_VERIFY_RAW in {"0", "false", "no", "off"}:
+        logger.warning("SSL_VERIFY=0 — проверка сертификатов отключена")
+        return False
+
+    ca_path = Path(SSL_CA_BUNDLE) if SSL_CA_BUNDLE else _DEFAULT_CA_BUNDLE
+    if not ca_path.is_file():
+        logger.warning(
+            "CA bundle не найден (%s) — обычная проверка SSL (может упасть на Минцифре)",
+            ca_path,
+        )
+        return True
+
+    ctx = ssl.create_default_context()
+    ctx.load_verify_locations(cafile=str(ca_path))
+    logger.info("SSL: системные CA + %s", ca_path.name)
+    return ctx
+
+
+def _http_client(**kwargs: Any) -> httpx.Client:
+    kwargs.setdefault("verify", _SSL_VERIFY)
+    return httpx.Client(**kwargs)
 
 
 def _auth_headers() -> dict[str, str]:
@@ -188,7 +223,7 @@ def _attachment_unique_id(att: dict[str, Any], message_id: str, index: int) -> s
 
 
 def max_get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-    with httpx.Client(timeout=HTTP_TIMEOUT + POLL_TIMEOUT + 5) as client:
+    with _http_client(timeout=HTTP_TIMEOUT + POLL_TIMEOUT + 5) as client:
         resp = client.get(
             f"{API_BASE}{path}",
             headers=_auth_headers(),
@@ -202,7 +237,7 @@ def max_get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
 
 
 def max_post_json(path: str, *, params: dict[str, Any] | None = None, body: dict[str, Any]) -> dict[str, Any]:
-    with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+    with _http_client(timeout=HTTP_TIMEOUT) as client:
         resp = client.post(
             f"{API_BASE}{path}",
             headers={**_auth_headers(), "Content-Type": "application/json"},
@@ -228,7 +263,7 @@ def send_message(chat_id: str, text: str) -> None:
 
 
 def download_bytes(url: str) -> bytes:
-    with httpx.Client(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
+    with _http_client(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
         resp = client.get(url, headers=_auth_headers())
         if resp.status_code >= 400:
             # Часть CDN-ссылок не требует Authorization
@@ -450,7 +485,9 @@ def poll_loop() -> None:
 
 
 def main() -> None:
+    global _SSL_VERIFY
     _require_env()
+    _SSL_VERIFY = _build_ssl_verify()
     poll_loop()
 
 
