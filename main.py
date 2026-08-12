@@ -21,7 +21,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("max-photo-bot")
 
-BOT_VERSION = "3"
+BOT_VERSION = "4"
 _ROOT = Path(__file__).resolve().parent
 _DEFAULT_CA_BUNDLE = _ROOT / "certs" / "russian_trusted_ca_bundle.pem"
 DEFAULT_CHAT_ID = "-73114090287804"
@@ -32,7 +32,7 @@ PHOTO_INBOX_URL = (
     os.environ.get("PHOTO_INBOX_URL") or "http://base.401010.ru/api/photo-inbox"
 ).strip()
 PHOTO_INBOX_TOKEN = (os.environ.get("PHOTO_INBOX_TOKEN") or "").strip()
-REPLY_ON_SUCCESS = (os.environ.get("REPLY_ON_SUCCESS") or "1").strip().lower() not in {
+REPLY_ON_SUCCESS = (os.environ.get("REPLY_ON_SUCCESS") or "0").strip().lower() not in {
     "0",
     "false",
     "no",
@@ -44,6 +44,9 @@ SHOW_IDS_IN_REPLY = (os.environ.get("SHOW_IDS_IN_REPLY") or "0").strip().lower()
     "no",
     "off",
 }
+ERROR_REPLY_TEXT = (
+    os.environ.get("ERROR_REPLY_TEXT") or "ошибка, загрузка не удалась."
+).strip() or "ошибка, загрузка не удалась."
 HTTP_TIMEOUT = float(os.environ.get("HTTP_TIMEOUT_SEC") or "60")
 POLL_TIMEOUT = int(os.environ.get("POLL_TIMEOUT_SEC") or "30")
 POLL_LIMIT = int(os.environ.get("POLL_LIMIT") or "100")
@@ -258,15 +261,27 @@ def max_post_json(path: str, *, params: dict[str, Any] | None = None, body: dict
     return data
 
 
-def send_message(chat_id: str, text: str) -> None:
+def send_message(
+    chat_id: str,
+    text: str,
+    *,
+    reply_to_mid: str | None = None,
+) -> None:
+    body: dict[str, Any] = {"text": text[:4000]}
+    if reply_to_mid:
+        body["link"] = {"type": "reply", "mid": reply_to_mid}
     try:
         max_post_json(
             "/messages",
             params={"chat_id": chat_id},
-            body={"text": text[:4000]},
+            body=body,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("send_message failed chat=%s: %s", chat_id, exc)
+
+
+def reply_upload_error(chat_id: str, mid: str) -> None:
+    send_message(chat_id, ERROR_REPLY_TEXT, reply_to_mid=mid or None)
 
 
 def download_bytes(url: str) -> bytes:
@@ -375,6 +390,7 @@ def process_message_created(update: dict[str, Any]) -> None:
         url = _attachment_url(att)
         if not url:
             logger.warning("Image without url mid=%s idx=%s", mid, idx)
+            last_error = "no url"
             continue
         uid = _attachment_unique_id(att, mid, idx)
         filename = _guess_filename(url, f"{uid}.jpg")
@@ -416,6 +432,7 @@ def process_message_created(update: dict[str, Any]) -> None:
             logger.warning("Inbox reject: %s", last_error)
 
     if ok_any:
+        # Успех — без сообщения в чат (REPLY_ON_SUCCESS оставлен для отладки).
         if REPLY_ON_SUCCESS or SHOW_IDS_IN_REPLY:
             if last_dup:
                 reply = "Уже было в инбоксе"
@@ -425,11 +442,11 @@ def process_message_created(update: dict[str, Any]) -> None:
                 reply = "Готово"
             if SHOW_IDS_IN_REPLY:
                 reply += "\n" + _ids_block(chat_id)
-            send_message(chat_id, reply)
+            send_message(chat_id, reply, reply_to_mid=mid or None)
         return
 
-    if last_error:
-        send_message(chat_id, f"Не принято: {last_error}"[:400])
+    logger.warning("Upload failed chat=%s mid=%s err=%s", chat_id, mid, last_error or "unknown")
+    reply_upload_error(chat_id, mid)
 
 
 def process_update(update: dict[str, Any]) -> None:
