@@ -103,8 +103,10 @@ def _build_ssl_verify() -> ssl.SSLContext | bool | str:
         )
         return True
 
+    # Bothost/Windows могут отдать CRLF — OpenSSL ждёт LF в PEM.
+    raw = ca_path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
     ctx = ssl.create_default_context()
-    ctx.load_verify_locations(cafile=str(ca_path))
+    ctx.load_verify_locations(cadata=raw.decode("ascii"))
     logger.info("SSL: системные CA + %s", ca_path.name)
     return ctx
 
