@@ -21,15 +21,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger("max-photo-bot")
 
-BOT_VERSION = "4"
+BOT_VERSION = "6"
 _ROOT = Path(__file__).resolve().parent
 _DEFAULT_CA_BUNDLE = _ROOT / "certs" / "russian_trusted_ca_bundle.pem"
 DEFAULT_CHAT_ID = "-73114090287804"
+INBOX_ORIGIN = "https://ostroeclub.ru"
 
 API_BASE = (os.environ.get("MAX_API_BASE") or "https://platform-api2.max.ru").rstrip("/")
 BOT_TOKEN = (os.environ.get("BOT_TOKEN") or os.environ.get("MAX_BOT_TOKEN") or "").strip()
-PHOTO_INBOX_URL = (
-    os.environ.get("PHOTO_INBOX_URL") or "http://base.401010.ru/api/photo-inbox"
+_PHOTO_INBOX_URL_RAW = (
+    os.environ.get("PHOTO_INBOX_URL") or f"{INBOX_ORIGIN}/api/photo-inbox"
 ).strip()
 PHOTO_INBOX_TOKEN = (os.environ.get("PHOTO_INBOX_TOKEN") or "").strip()
 REPLY_ON_SUCCESS = (os.environ.get("REPLY_ON_SUCCESS") or "0").strip().lower() not in {
@@ -47,7 +48,33 @@ SHOW_IDS_IN_REPLY = (os.environ.get("SHOW_IDS_IN_REPLY") or "0").strip().lower()
 ERROR_REPLY_TEXT = (
     os.environ.get("ERROR_REPLY_TEXT") or "ошибка, загрузка не удалась."
 ).strip() or "ошибка, загрузка не удалась."
-HTTP_TIMEOUT = float(os.environ.get("HTTP_TIMEOUT_SEC") or "60")
+
+
+def _env_float(name: str, default: str) -> float:
+    raw = (os.environ.get(name) or default).strip()
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Некорректное %s=%r, использую %s", name, raw, default)
+        return float(default)
+
+
+def _env_int(name: str, default: str) -> int:
+    raw = (os.environ.get(name) or default).strip()
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Некорректное %s=%r, использую %s", name, raw, default)
+        return int(default)
+
+
+_LEGACY_HTTP_TIMEOUT = (os.environ.get("HTTP_TIMEOUT_SEC") or "120").strip()
+HTTP_CONNECT_TIMEOUT = _env_float("HTTP_CONNECT_TIMEOUT_SEC", "15")
+HTTP_READ_TIMEOUT = _env_float("HTTP_READ_TIMEOUT_SEC", _LEGACY_HTTP_TIMEOUT)
+HTTP_WRITE_TIMEOUT = _env_float("HTTP_WRITE_TIMEOUT_SEC", _LEGACY_HTTP_TIMEOUT)
+HTTP_RETRY_COUNT = max(1, _env_int("HTTP_RETRY_COUNT", "3"))
+HTTP_RETRY_BACKOFF = max(0.0, _env_float("HTTP_RETRY_BACKOFF_SEC", "2"))
+HEALTH_CHECK_SEC = max(0.0, _env_float("HEALTH_CHECK_SEC", "300"))
 POLL_TIMEOUT = int(os.environ.get("POLL_TIMEOUT_SEC") or "30")
 POLL_LIMIT = int(os.environ.get("POLL_LIMIT") or "100")
 # SSL для platform-api2.max.ru (сертификат Минцифры). По умолчанию — бандл в certs/.
@@ -122,6 +149,64 @@ def _build_ssl_verify() -> ssl.SSLContext | bool | str:
 def _http_client(**kwargs: Any) -> httpx.Client:
     kwargs.setdefault("verify", _SSL_VERIFY)
     return httpx.Client(**kwargs)
+
+
+def _redact_url(url: str) -> str:
+    return re.sub(r"(token=)[^&]+", r"\1***", url, flags=re.IGNORECASE)
+
+
+def _normalize_inbox_url(url: str) -> str:
+    """Старый хост base.401010.ru и http://ostroeclub.ru → https://ostroeclub.ru."""
+    raw = (url or "").strip() or f"{INBOX_ORIGIN}/api/photo-inbox"
+    parsed = urlparse(raw)
+    host = (parsed.hostname or "").lower()
+    if host not in {
+        "base.401010.ru",
+        "www.base.401010.ru",
+        "ostroeclub.ru",
+        "www.ostroeclub.ru",
+    }:
+        return raw
+    path = parsed.path or "/api/photo-inbox"
+    if path in {"", "/"}:
+        path = "/api/photo-inbox"
+    query = f"?{parsed.query}" if parsed.query else ""
+    rewritten = f"{INBOX_ORIGIN}{path}{query}"
+    if rewritten != raw:
+        logger.warning(
+            "PHOTO_INBOX_URL %s заменён на %s",
+            _redact_url(raw),
+            _redact_url(rewritten),
+        )
+    return rewritten
+
+
+PHOTO_INBOX_URL = _normalize_inbox_url(_PHOTO_INBOX_URL_RAW)
+
+
+def _inbox_timeout() -> httpx.Timeout:
+    return httpx.Timeout(
+        connect=HTTP_CONNECT_TIMEOUT,
+        read=HTTP_READ_TIMEOUT,
+        write=HTTP_WRITE_TIMEOUT,
+        pool=HTTP_CONNECT_TIMEOUT,
+    )
+
+
+def _retryable_status(code: int) -> bool:
+    return code in {408, 425, 429, 500, 502, 503, 504}
+
+
+def _retryable_exc(exc: BaseException) -> bool:
+    return isinstance(
+        exc,
+        (
+            httpx.TimeoutException,
+            httpx.ConnectError,
+            httpx.NetworkError,
+            httpx.RemoteProtocolError,
+        ),
+    )
 
 
 def _auth_headers() -> dict[str, str]:
@@ -233,7 +318,7 @@ def _attachment_unique_id(att: dict[str, Any], message_id: str, index: int) -> s
 
 
 def max_get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-    with _http_client(timeout=HTTP_TIMEOUT + POLL_TIMEOUT + 5) as client:
+    with _http_client(timeout=HTTP_READ_TIMEOUT + POLL_TIMEOUT + 5) as client:
         resp = client.get(
             f"{API_BASE}{path}",
             headers=_auth_headers(),
@@ -247,7 +332,7 @@ def max_get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
 
 
 def max_post_json(path: str, *, params: dict[str, Any] | None = None, body: dict[str, Any]) -> dict[str, Any]:
-    with _http_client(timeout=HTTP_TIMEOUT) as client:
+    with _http_client(timeout=_inbox_timeout()) as client:
         resp = client.post(
             f"{API_BASE}{path}",
             headers={**_auth_headers(), "Content-Type": "application/json"},
@@ -285,13 +370,45 @@ def reply_upload_error(chat_id: str, mid: str) -> None:
 
 
 def download_bytes(url: str) -> bytes:
-    with _http_client(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
-        resp = client.get(url, headers=_auth_headers())
-        if resp.status_code >= 400:
-            # Часть CDN-ссылок не требует Authorization
-            resp = client.get(url)
-        resp.raise_for_status()
-        return bytes(resp.content)
+    last_exc: BaseException | None = None
+    for attempt in range(1, HTTP_RETRY_COUNT + 1):
+        try:
+            with _http_client(timeout=_inbox_timeout(), follow_redirects=True) as client:
+                resp = client.get(url, headers=_auth_headers())
+                if resp.status_code >= 400:
+                    # Часть CDN-ссылок не требует Authorization
+                    resp = client.get(url)
+                resp.raise_for_status()
+                return bytes(resp.content)
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if _retryable_exc(exc) and attempt < HTTP_RETRY_COUNT:
+                logger.warning(
+                    "Download retry attempt=%s/%s err=%s",
+                    attempt,
+                    HTTP_RETRY_COUNT,
+                    exc,
+                )
+                time.sleep(HTTP_RETRY_BACKOFF * attempt)
+                continue
+            raise
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("download failed")
+
+
+def _parse_inbox_response(resp: httpx.Response) -> dict[str, Any]:
+    try:
+        payload = resp.json()
+    except Exception:  # noqa: BLE001
+        payload = {"ok": False, "message": (resp.text or "")[:300]}
+    if not isinstance(payload, dict):
+        payload = {"ok": False, "message": str(payload)[:300]}
+    payload.setdefault("status", resp.status_code)
+    if resp.status_code >= 400:
+        payload["ok"] = False
+        payload.setdefault("message", f"HTTP {resp.status_code}")
+    return payload
 
 
 def upload_to_inbox(
@@ -320,19 +437,104 @@ def upload_to_inbox(
         "sender_name": sender_name,
         "caption": caption,
     }
-    with httpx.Client(timeout=HTTP_TIMEOUT) as client:
-        resp = client.post(url, data=form, files=files)
+    size_kb = len(data) / 1024
+    log_ctx = (
+        f"chat={chat_id} mid={message_id} uid={file_unique_id} "
+        f"file={filename!r} size={size_kb:.1f}KiB url={_redact_url(url)}"
+    )
+    last_exc: BaseException | None = None
+    last_status: int | None = None
+    for attempt in range(1, HTTP_RETRY_COUNT + 1):
+        t0 = time.monotonic()
+        logger.info("Upload start attempt=%s/%s %s", attempt, HTTP_RETRY_COUNT, log_ctx)
+        try:
+            with httpx.Client(timeout=_inbox_timeout()) as client:
+                resp = client.post(url, data=form, files=files)
+            elapsed = time.monotonic() - t0
+            last_status = resp.status_code
+            payload = _parse_inbox_response(resp)
+            if _retryable_status(resp.status_code) and attempt < HTTP_RETRY_COUNT:
+                logger.warning(
+                    "Upload HTTP %s attempt=%s elapsed=%.2fs %s",
+                    resp.status_code,
+                    attempt,
+                    elapsed,
+                    log_ctx,
+                )
+                time.sleep(HTTP_RETRY_BACKOFF * attempt)
+                continue
+            logger.info(
+                "Upload done attempt=%s elapsed=%.2fs http=%s ok=%s duplicate=%s id=%s",
+                attempt,
+                elapsed,
+                resp.status_code,
+                payload.get("ok"),
+                payload.get("duplicate"),
+                payload.get("id"),
+            )
+            return payload
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            elapsed = time.monotonic() - t0
+            if _retryable_exc(exc) and attempt < HTTP_RETRY_COUNT:
+                logger.warning(
+                    "Upload retry attempt=%s/%s elapsed=%.2fs err=%s: %s",
+                    attempt,
+                    HTTP_RETRY_COUNT,
+                    elapsed,
+                    exc.__class__.__name__,
+                    exc,
+                )
+                time.sleep(HTTP_RETRY_BACKOFF * attempt)
+                continue
+            logger.error(
+                "Upload failed attempt=%s/%s elapsed=%.2fs err=%s: %s",
+                attempt,
+                HTTP_RETRY_COUNT,
+                elapsed,
+                exc.__class__.__name__,
+                exc,
+            )
+            raise
+    if last_exc is not None:
+        raise last_exc
+    return {
+        "ok": False,
+        "status": last_status or 0,
+        "message": f"HTTP {last_status}" if last_status else "upload failed",
+    }
+
+
+def _check_vps_health() -> bool:
+    parsed = urlparse(PHOTO_INBOX_URL)
+    if not parsed.scheme or not parsed.netloc:
+        return False
+    probe = f"{parsed.scheme}://{parsed.netloc}/login"
+    t0 = time.monotonic()
     try:
-        payload = resp.json()
-    except Exception:  # noqa: BLE001
-        payload = {"ok": False, "message": (resp.text or "")[:300]}
-    if not isinstance(payload, dict):
-        payload = {"ok": False, "message": str(payload)[:300]}
-    payload.setdefault("status", resp.status_code)
-    if resp.status_code >= 400:
-        payload["ok"] = False
-        payload.setdefault("message", f"HTTP {resp.status_code}")
-    return payload
+        with httpx.Client(
+            timeout=httpx.Timeout(connect=10.0, read=10.0, write=10.0, pool=10.0),
+            follow_redirects=True,
+        ) as client:
+            resp = client.get(probe)
+        ok = resp.status_code < 500
+        logger.info(
+            "Health ok=%s probe=%s http=%s elapsed=%.2fs",
+            ok,
+            probe,
+            resp.status_code,
+            time.monotonic() - t0,
+        )
+        return ok
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Health failed probe=%s elapsed=%.2fs err=%s: %s",
+            probe,
+            time.monotonic() - t0,
+            exc.__class__.__name__,
+            exc,
+        )
+        return False
 
 
 def handle_command(chat_id: str, text: str) -> bool:
@@ -459,14 +661,22 @@ def process_update(update: dict[str, Any]) -> None:
 
 def poll_loop() -> None:
     marker: int | None = None
+    last_health = 0.0
     logger.info(
-        "Starting MAX photo bot v%s → %s | allow=%s | api=%s",
+        "Starting MAX photo bot v%s → %s | allow=%s | api=%s | retries=%s",
         BOT_VERSION,
-        PHOTO_INBOX_URL,
+        _redact_url(PHOTO_INBOX_URL),
         ",".join(sorted(ALLOWED_CHAT_IDS)) or "(all)",
         API_BASE,
+        HTTP_RETRY_COUNT,
     )
+    if HEALTH_CHECK_SEC > 0:
+        _check_vps_health()
+        last_health = time.monotonic()
     while True:
+        if HEALTH_CHECK_SEC > 0 and time.monotonic() - last_health >= HEALTH_CHECK_SEC:
+            _check_vps_health()
+            last_health = time.monotonic()
         params: dict[str, Any] = {
             "limit": POLL_LIMIT,
             "timeout": POLL_TIMEOUT,

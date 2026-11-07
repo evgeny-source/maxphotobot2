@@ -82,13 +82,21 @@ python main.py
 | Переменная | Значение |
 |---|---|
 | `BOT_TOKEN` | токен MAX-бота |
-| `PHOTO_INBOX_URL` | `http://base.401010.ru/api/photo-inbox` |
+| `PHOTO_INBOX_URL` | `https://ostroeclub.ru/api/photo-inbox` (старый `base.401010.ru` бот подменяет сам) |
 | `PHOTO_INBOX_TOKEN` | тот же, что на сервере optical |
 | `ALLOWED_CHAT_IDS` | `-73114090287804` (или свой id / `*` для всех) |
 | `REPLY_ON_SUCCESS` | `0` (успех без сообщения; ошибки — всегда) |
+| `HTTP_TIMEOUT_SEC` | `120` |
+| `HTTP_CONNECT_TIMEOUT_SEC` | `15` |
+| `HTTP_RETRY_COUNT` | `3` |
+| `HTTP_RETRY_BACKOFF_SEC` | `2` |
+| `HEALTH_CHECK_SEC` | `300` (0 = выкл) |
+
+При обрыве связи или `502/503/504` загрузка повторяется. Каждые `HEALTH_CHECK_SEC`
+секунд бот проверяет `GET /login` на том же хосте.
 
 7. Добавьте бота в рабочий чат как **админа**, отправьте тестовое фото.
-8. Инбокс: https://base.401010.ru/photo-inbox — источник `max`.
+8. Инбокс: https://ostroeclub.ru/photo-inbox — источник `max`.
 
 ## Поток
 
