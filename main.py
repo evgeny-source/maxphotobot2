@@ -21,7 +21,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("max-photo-bot")
 
-BOT_VERSION = "7"
+BOT_VERSION = "8"
 _ROOT = Path(__file__).resolve().parent
 _DEFAULT_CA_BUNDLE = _ROOT / "certs" / "russian_trusted_ca_bundle.pem"
 _MARKER_PATH = Path(os.environ.get("DATA_DIR") or _ROOT) / "max_updates_marker.txt"
@@ -291,20 +291,25 @@ def _looks_like_image(att: dict[str, Any]) -> bool:
     return ext in _IMAGE_EXTS
 
 
+def _as_att_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    return []
+
+
 def _attachment_buckets(message: dict[str, Any]) -> list[list[Any]]:
-    """Обычные фото в body; пересланные — в link.message."""
+    """Обычные фото в body; пересланные — в link.message (attachments/attaches)."""
     buckets: list[list[Any]] = []
     body = message.get("body") if isinstance(message.get("body"), dict) else {}
-    for raw in (
-        body.get("attachments"),
-        message.get("attachments"),
-    ):
-        if isinstance(raw, list):
-            buckets.append(raw)
     link = message.get("link") if isinstance(message.get("link"), dict) else {}
     linked = link.get("message") if isinstance(link.get("message"), dict) else {}
-    if isinstance(linked.get("attachments"), list):
-        buckets.append(linked["attachments"])
+    for obj in (body, message, linked, link):
+        if not isinstance(obj, dict):
+            continue
+        for key in ("attachments", "attaches"):
+            raw = _as_att_list(obj.get(key))
+            if raw:
+                buckets.append(raw)
     return buckets
 
 
