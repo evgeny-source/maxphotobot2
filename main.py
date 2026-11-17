@@ -21,9 +21,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("max-photo-bot")
 
-BOT_VERSION = "6"
+BOT_VERSION = "7"
 _ROOT = Path(__file__).resolve().parent
 _DEFAULT_CA_BUNDLE = _ROOT / "certs" / "russian_trusted_ca_bundle.pem"
+_MARKER_PATH = Path(os.environ.get("DATA_DIR") or _ROOT) / "max_updates_marker.txt"
 DEFAULT_CHAT_ID = "-73114090287804"
 INBOX_ORIGIN = "https://ostroeclub.ru"
 
@@ -274,47 +275,100 @@ def _guess_filename(url: str, fallback: str) -> str:
 
 
 def _looks_like_image(att: dict[str, Any]) -> bool:
-    att_type = str(att.get("type") or "").lower()
+    att_type = str(att.get("type") or att.get("_type") or "").lower()
     if att_type in {"image", "photo"}:
         return True
     if att_type not in {"file", "share"}:
         return False
-    payload = att.get("payload") or {}
+    payload = att.get("payload") if isinstance(att.get("payload"), dict) else {}
     mime = str(payload.get("mime_type") or payload.get("mime") or "").lower()
     if mime.startswith("image/"):
         return True
-    name = str(payload.get("file_name") or payload.get("filename") or "").lower()
+    name = str(
+        payload.get("file_name") or payload.get("filename") or att.get("name") or ""
+    ).lower()
     ext = os.path.splitext(name)[1]
     return ext in _IMAGE_EXTS
 
 
+def _attachment_buckets(message: dict[str, Any]) -> list[list[Any]]:
+    """Обычные фото в body; пересланные — в link.message."""
+    buckets: list[list[Any]] = []
+    body = message.get("body") if isinstance(message.get("body"), dict) else {}
+    for raw in (
+        body.get("attachments"),
+        message.get("attachments"),
+    ):
+        if isinstance(raw, list):
+            buckets.append(raw)
+    link = message.get("link") if isinstance(message.get("link"), dict) else {}
+    linked = link.get("message") if isinstance(link.get("message"), dict) else {}
+    if isinstance(linked.get("attachments"), list):
+        buckets.append(linked["attachments"])
+    return buckets
+
+
 def _image_attachments(message: dict[str, Any]) -> list[dict[str, Any]]:
-    body = message.get("body") or {}
-    attachments = body.get("attachments") or []
-    if not isinstance(attachments, list):
-        return []
     out: list[dict[str, Any]] = []
-    for att in attachments:
-        if isinstance(att, dict) and _looks_like_image(att):
+    seen: set[str] = set()
+    for bucket in _attachment_buckets(message):
+        for att in bucket:
+            if not isinstance(att, dict) or not _looks_like_image(att):
+                continue
+            key = json_dumps_id(att)
+            if key in seen:
+                continue
+            seen.add(key)
             out.append(att)
     return out
 
 
+def json_dumps_id(att: dict[str, Any]) -> str:
+    payload = att.get("payload") if isinstance(att.get("payload"), dict) else {}
+    for key in ("photo_id", "id", "token", "file_id", "photoId", "photoToken"):
+        val = payload.get(key)
+        if val in (None, "", 0):
+            val = att.get(key)
+        if val not in (None, "", 0):
+            return str(val)
+    url = _attachment_url(att) or ""
+    return url or repr(sorted(att.keys()))
+
+
 def _attachment_url(att: dict[str, Any]) -> str | None:
-    payload = att.get("payload") or {}
-    url = payload.get("url") or att.get("url")
-    if isinstance(url, str) and url.startswith(("http://", "https://")):
-        return url
+    payload = att.get("payload") if isinstance(att.get("payload"), dict) else {}
+    for key in ("url", "baseUrl", "baseRawUrl"):
+        url = payload.get(key) or att.get(key)
+        if isinstance(url, str) and url.startswith(("http://", "https://")):
+            return url
     return None
 
 
 def _attachment_unique_id(att: dict[str, Any], message_id: str, index: int) -> str:
-    payload = att.get("payload") or {}
-    for key in ("photo_id", "id", "token", "file_id"):
+    payload = att.get("payload") if isinstance(att.get("payload"), dict) else {}
+    for key in ("photo_id", "id", "token", "file_id", "photoId", "photoToken"):
         val = payload.get(key)
+        if val in (None, "", 0):
+            val = att.get(key)
         if val not in (None, "", 0):
             return f"max:{val}"
     return f"max:{message_id}:{index}"
+
+
+def _load_marker() -> int | None:
+    try:
+        raw = _MARKER_PATH.read_text(encoding="utf-8").strip()
+        return int(raw) if raw else None
+    except (OSError, ValueError):
+        return None
+
+
+def _save_marker(marker: int) -> None:
+    try:
+        _MARKER_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _MARKER_PATH.write_text(str(int(marker)), encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Не удалось сохранить marker: %s", exc)
 
 
 def max_get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -573,6 +627,13 @@ def process_message_created(update: dict[str, Any]) -> None:
 
     images = _image_attachments(message)
     if not images:
+        link = message.get("link") if isinstance(message.get("link"), dict) else {}
+        logger.info(
+            "Skip no-image chat=%s mid=%s link=%s",
+            chat_id,
+            mid,
+            link.get("type"),
+        )
         return
     if chat_id is None:
         logger.warning("Image without chat_id, skip mid=%s", mid)
@@ -660,15 +721,16 @@ def process_update(update: dict[str, Any]) -> None:
 
 
 def poll_loop() -> None:
-    marker: int | None = None
+    marker: int | None = _load_marker()
     last_health = 0.0
     logger.info(
-        "Starting MAX photo bot v%s → %s | allow=%s | api=%s | retries=%s",
+        "Starting MAX photo bot v%s → %s | allow=%s | api=%s | retries=%s | marker=%s",
         BOT_VERSION,
         _redact_url(PHOTO_INBOX_URL),
         ",".join(sorted(ALLOWED_CHAT_IDS)) or "(all)",
         API_BASE,
         HTTP_RETRY_COUNT,
+        marker if marker is not None else "none",
     )
     if HEALTH_CHECK_SEC > 0:
         _check_vps_health()
@@ -703,6 +765,7 @@ def poll_loop() -> None:
         if next_marker is not None:
             try:
                 marker = int(next_marker)
+                _save_marker(marker)
             except (TypeError, ValueError):
                 pass
 
